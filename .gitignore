@@ -1,0 +1,109 @@
+# ============================
+# Python
+# ============================
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Compiled extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# PyInstaller
+*.spec
+
+# ============================
+# Virtual Environments
+# ============================
+
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# ============================
+# VSCode
+# ============================
+
+.vscode/
+.history/
+
+# ============================
+# OS files
+# ============================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================
+# Project Specific
+# ============================
+
+# Inputs sensíveis (PDFs reais)
+inputs/
+
+# Outputs gerados
+outputs/
+
+# Logs
+logs/
+*.log
+
+# Arquivos temporários
+*.tmp
+*.bak
+
+# SQLite / databases locais
+*.sqlite3
+*.db
+
+# ============================
+# MyPy / Ruff / Lint
+# ============================
+
+.mypy_cache/
+.ruff_cache/
+
+# ============================
+# Jupyter
+# ============================
+
+.ipynb_checkpoints/

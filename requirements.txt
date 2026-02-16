@@ -1,0 +1,7 @@
+pdfplumber
+pandas
+openpyxl
+rapidfuzz
+pydantic
+rich
+unidecode
