@@ -30,13 +30,18 @@ TX_CREDIT_RE = re.compile(
 )
 
 INTERNATIONAL_BASE_RE = re.compile(
-    r"^(\d{2}\s+\w{3})\s+(.+?)\s+([A-Z]{3})\s+([\d.,]+)\s*$"
-)
-
-CONVERSION_RE = re.compile(
-    r"Convers[aã]o\s+para\s+Real\s*-\s*R\$\s*([\d.,]+)",
+    r"^(\d{2}\s+\w{3})\s+(.+?)\s+((?:[A-Z]{3})|(?:US\$)|(?:U\$))\s*([\d.,]+)\s*$",
     re.IGNORECASE,
 )
+
+
+CONVERSION_RE = re.compile(
+    r"Convers[aã]o\s+para\s+Real\b.*?(?:R\$\s*)?(-?[\d.,]+)",
+    re.IGNORECASE,
+)
+
+CONVERSION_WORD_RE = re.compile(r"Convers[aã]o\s+para\s+Real\b", re.IGNORECASE)
+BRL_VALUE_IN_LINE_RE = re.compile(r"(?:R\$\s*)?(-?[\d]{1,3}(?:\.[\d]{3})*,[\d]{2}|-?[\d]+,[\d]{2})")
 
 
 def _extract_year(text: str) -> int:
@@ -120,6 +125,12 @@ def _page_lines(page) -> List[Dict[str, Any]]:
 
     return _cluster_words_into_lines_split_columns(words, page_mid_x=mid, y_tol=3.0)
 
+def _extract_brl_from_line(line: str) -> Optional[float]:
+    m = BRL_VALUE_IN_LINE_RE.search(line or "")
+    if not m:
+        return None
+    return parse_brl_value(m.group(1))
+
 
 def parse_btg_pdf(pdf_path: str, pdf_password: Optional[str] = None) -> Iterator[Transaction]:
     logging.info(f"Iniciando análise do PDF do BTG: {pdf_path}")
@@ -155,15 +166,32 @@ def parse_btg_pdf(pdf_path: str, pdf_password: Optional[str] = None) -> Iterator
                     raw_lines = [line]
 
                     brl_amount = None
-                    for j in range(1, 11):
+                    pending_next_value = False
+
+                    for j in range(1, 16):
                         if i + j >= len(lines):
                             break
                         nxt = lines[i + j]["text"]
                         raw_lines.append(nxt)
+
+                        # caso 1: já veio “Conversão para Real ... 110,88”
                         mc = CONVERSION_RE.search(nxt)
                         if mc:
                             brl_amount = parse_brl_value(mc.group(1))
-                            break
+                            if brl_amount is not None:
+                                break
+
+                        # caso 2: veio só “Conversão para Real -” e o valor está na próxima linha
+                        if CONVERSION_WORD_RE.search(nxt) and _extract_brl_from_line(nxt) is None:
+                            pending_next_value = True
+                            continue
+
+                        if pending_next_value:
+                            v = _extract_brl_from_line(nxt)
+                            if v is not None:
+                                brl_amount = v
+                                break
+
 
                     if brl_amount is not None:
                         tx_date = parse_date_d_mon(date_str, pdf_year)

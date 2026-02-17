@@ -19,17 +19,17 @@ def resolve_pwd() -> str | None:
 
 
 BTG = Path("inputs/btg.pdf")
-ORG = Path("inputs/organize_pdfs/1748.pdf")
+ORG = Path("inputs/organize_pdfs/7981.pdf")
 
 pdf_password = resolve_pwd()
 
-btg = [t for t in parse_btg_pdf(str(BTG), pdf_password=pdf_password) if t.card_final == "1748"]
+btg = [t for t in parse_btg_pdf(str(BTG), pdf_password=pdf_password) if t.card_final == "7981"]
 org = list(parse_organize_pdf(str(ORG), pdf_password=pdf_password))
 
-print("BTG 1748:", len(btg))
+print("BTG 7981:", len(btg))
 for t in sorted(btg, key=lambda x: float(x.amount)):
     print(t.tx_date, t.amount, t.description_raw)
 
-print("\nORGANIZE 1748:", len(org))
+print("\nORGANIZE 7981:", len(org))
 for t in sorted(org, key=lambda x: float(x.amount)):
     print(t.tx_date, t.amount, t.description_raw)
