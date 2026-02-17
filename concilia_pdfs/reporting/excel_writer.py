@@ -1,124 +1,86 @@
-import pandas as pd
+# concilia_pdfs/reporting/excel_writer.py
 import logging
 from pathlib import Path
-from typing import List, Dict
-from collections import defaultdict
 from decimal import Decimal
+from typing import List, Dict
+
+import pandas as pd
 
 from concilia_pdfs.core.models import Transaction
 from concilia_pdfs.core.reconciliation import ReconciliationResult
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 
 def _to_float(d: Decimal | None) -> float | None:
-    """Converte Decimal para float de forma segura."""
-    if d is None:
-        return None
-    return float(d)
+    return float(d) if d is not None else None
+
+
+def _tx_to_row(action: str, tx: Transaction) -> dict:
+    return {
+        "acao": action,  # INCLUIR / EXCLUIR
+        "cartao": tx.card_final,
+        "data": tx.tx_date,
+        "descricao": tx.description_raw,
+        "valor_brl": _to_float(tx.amount),
+        "fonte": tx.source.value if hasattr(tx.source, "value") else str(tx.source),
+        "moeda": getattr(tx, "foreign_currency", None),
+        "valor_estrangeiro": _to_float(getattr(tx, "foreign_amount", None)),
+    }
+
 
 def generate_excel_report(
     reconciliation_results: Dict[str, ReconciliationResult],
-    all_btg_txs: List[Transaction],
-    all_organize_txs: List[Transaction],
-    output_dir: str
+    all_btg_txs: List[Transaction],          # mantido por compatibilidade
+    all_organize_txs: List[Transaction],     # mantido por compatibilidade
+    output_dir: str,
 ):
     """
-    Gera um relatório Excel para o resultado da reconciliação de cada cartão.
+    Gera Excel SOMENTE com diferenças (nunca inclui itens que bateram).
+    Ordena por valor_brl (menor -> maior).
     """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    logging.info(f"Gerando relatórios Excel em: {output_dir}")
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Agrupa transações brutas por cartão para as planilhas
-    btg_by_card = defaultdict(list)
-    for tx in all_btg_txs:
-        btg_by_card[tx.card_final].append(tx.model_dump())
-
-    organize_by_card = defaultdict(list)
-    for tx in all_organize_txs:
-        organize_by_card[tx.card_final].append(tx.model_dump())
+    total_files = 0
 
     for card_final, result in reconciliation_results.items():
-        report_path = output_path / f"{card_final}_conciliacao.xlsx"
-        logging.info(f"Gerando relatório para o cartão {card_final} em: {report_path}")
+        rows: list[dict] = []
 
-        with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
-            # 1. Planilha btg_normalizado
-            if card_final in btg_by_card:
-                df_btg = pd.DataFrame(btg_by_card[card_final])
-                df_btg['amount'] = pd.to_numeric(df_btg['amount'])
-                df_btg['foreign_amount'] = pd.to_numeric(df_btg['foreign_amount'])
-                df_btg.to_excel(writer, sheet_name='btg_normalizado', index=False)
+        for tx in result.missing_in_organize:
+            rows.append(_tx_to_row("INCLUIR", tx))
 
-            # 2. Planilha organize_normalizado
-            if card_final in organize_by_card:
-                df_org = pd.DataFrame(organize_by_card[card_final])
-                df_org['amount'] = pd.to_numeric(df_org['amount'])
-                df_org.to_excel(writer, sheet_name='organize_normalizado', index=False)
+        for tx in result.extra_in_organize:
+            rows.append(_tx_to_row("EXCLUIR", tx))
 
-            # 3. Planilha comparativo
-            comp_data = []
-            for btg_tx, org_tx, score in result.exact_matches:
-                comp_data.append({
-                    "status": "CORRESPONDÊNCIA EXATA", "btg_date": btg_tx.tx_date, "btg_desc": btg_tx.description_raw,
-                    "btg_amount": _to_float(btg_tx.amount), "org_date": org_tx.tx_date, "org_desc": org_tx.description_raw,
-                    "org_amount": _to_float(org_tx.amount), "similarity": score, "diff_amount": 0.0
-                })
-            for btg_tx, org_tx, score, diff in result.possible_divergences:
-                 comp_data.append({
-                    "status": "POSSÍVEL DIVERGÊNCIA", "btg_date": btg_tx.tx_date, "btg_desc": btg_tx.description_raw,
-                    "btg_amount": _to_float(btg_tx.amount), "org_date": org_tx.tx_date, "org_desc": org_tx.description_raw,
-                    "org_amount": _to_float(org_tx.amount), "similarity": score, "diff_amount": _to_float(diff)
-                })
-            
-            df_comp = pd.DataFrame(comp_data)
-            # Adiciona transações faltantes à planilha de comparação para uma visão completa
-            missing_rows = []
-            for btx_tx in result.missing_in_organize:
-                missing_rows.append({
-                    "status": "FALTANDO NO ORGANIZE", "btg_date": btx_tx.tx_date, "btg_desc": btx_tx.description_raw,
-                    "btg_amount": _to_float(btx_tx.amount)
-                })
-            df_comp = pd.concat([df_comp, pd.DataFrame(missing_rows)], ignore_index=True)
-            df_comp.to_excel(writer, sheet_name='comparativo', index=False)
+        if not rows:
+            logging.info(f"Cartão {card_final}: sem diferenças. Nenhum Excel gerado.")
+            continue
 
-            # 4. Planilha faltantes_no_organize
-            missing_data = [tx.model_dump() for tx in result.missing_in_organize]
-            if missing_data:
-                df_missing = pd.DataFrame(missing_data)
-                df_missing['amount'] = pd.to_numeric(df_missing['amount'])
-                df_missing.to_excel(writer, sheet_name='faltantes_no_organize', index=False)
-            
-            # (Opcional) Planilha extra_no_organize
-            extra_data = [tx.model_dump() for tx in result.extra_in_organize]
-            if extra_data:
-                df_extra = pd.DataFrame(extra_data)
-                df_extra['amount'] = pd.to_numeric(df_extra['amount'])
-                df_extra.to_excel(writer, sheet_name='extra_no_organize', index=False)
+        df = pd.DataFrame(rows)
 
-            # 5. Planilha resumo
-            sum_btg = sum(Decimal(t['amount']) for t in btg_by_card.get(card_final, []))
-            sum_org = sum(Decimal(t['amount']) for t in organize_by_card.get(card_final, []))
-            
-            summary = {
-                "Total de Lançamentos BTG": len(btg_by_card.get(card_final, [])),
-                "Total de Lançamentos Organize": len(organize_by_card.get(card_final, [])),
-                "Correspondências Exatas": len(result.exact_matches),
-                "Possíveis Divergências": len(result.possible_divergences),
-                "Faltando no Organize": len(result.missing_in_organize),
-                "Sobra no Organize": len(result.extra_in_organize),
-                "Soma dos Valores BTG": _to_float(sum_btg),
-                "Soma dos Valores Organize (Normalizado)": _to_float(sum_org),
-                "Diferença (BTG - Organize)": _to_float(sum_btg - sum_org)
-            }
-            df_summary = pd.DataFrame.from_dict(summary, orient='index', columns=['Valor'])
-            df_summary.to_excel(writer, sheet_name='resumo')
+        # Ordenação pedida: menor para maior por valor
+        df["valor_ord"] = df["valor_brl"].abs()  # ordena pelo "valor" independente do sinal
+        df = df.sort_values(by=["valor_ord", "acao", "data"], ascending=[True, True, True]).drop(columns=["valor_ord"])
 
-    logging.info("Geração de todos os relatórios Excel finalizada.")
+        report_path = out_dir / f"{card_final}_diferencas.xlsx"
 
+        with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="diferencas", index=False)
 
-if __name__ == '__main__':
-    # Exemplo de uso
-    print("Módulo de geração de relatórios Excel carregado.")
-    # Em um cenário real, você criaria objetos ReconciliationResult simulados aqui para teste.
+            resumo = pd.DataFrame(
+                {
+                    "campo": ["cartao", "qtd_incluir", "qtd_excluir"],
+                    "valor": [
+                        card_final,
+                        len(result.missing_in_organize),
+                        len(result.extra_in_organize),
+                    ],
+                }
+            )
+            resumo.to_excel(writer, sheet_name="resumo", index=False)
+
+        total_files += 1
+        logging.info(f"Gerado: {report_path}")
+
+    logging.info(f"Relatórios gerados: {total_files}")

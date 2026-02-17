@@ -1,145 +1,107 @@
+# concilia_pdfs/core/reconciliation.py
+from __future__ import annotations
+
 from collections import defaultdict
-from typing import List, Dict, Tuple
-import logging
 from decimal import Decimal
+from typing import List, Dict
+import logging
 
 from rapidfuzz import fuzz
 from pydantic import BaseModel, Field
 
 from concilia_pdfs.core.models import Transaction
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-SIMILARITY_THRESHOLD = 90  # 90% similarity for description matching
+SIMILARITY_THRESHOLD = 70  # só para desempate
+Q = Decimal("0.01")
 
-def amount_equal(a: Decimal, b: Decimal, tol: Decimal = Decimal("0.01")) -> bool:
-    """Verifica se dois valores Decimais são iguais dentro de uma dada tolerância."""
-    return abs(a - b) <= tol
+
+def _q(x: Decimal) -> Decimal:
+    return x.quantize(Q)
+
 
 class ReconciliationResult(BaseModel):
-    """Armazena os resultados da reconciliação para um único cartão."""
     card_final: str
-    exact_matches: List[Tuple[Transaction, Transaction, float]] = Field(default_factory=list)
-    possible_divergences: List[Tuple[Transaction, Transaction, float, float]] = Field(default_factory=list)
-    missing_in_organize: List[Transaction] = Field(default_factory=list)
-    extra_in_organize: List[Transaction] = Field(default_factory=list)
+    missing_in_organize: List[Transaction] = Field(default_factory=list)  # INCLUIR
+    extra_in_organize: List[Transaction] = Field(default_factory=list)    # EXCLUIR
+
 
 def reconcile_transactions(
-    btg_transactions: List[Transaction],
-    organize_transactions: List[Transaction]
+    btg_txs: List[Transaction],
+    org_txs: List[Transaction],
 ) -> Dict[str, ReconciliationResult]:
     """
-    Reconcilia as transações das fontes BTG e Organize.
+    Match principal por VALOR, tolerante a inversão de sinal.
+    Garante que NÃO vai marcar INCLUIR se existir no Organize (mesmo valor),
+    mesmo que o parser tenha invertido sinal diferente.
     """
-    logging.info(f"Iniciando processo de reconciliação para {len(btg_transactions)} transações BTG e "
-                 f"{len(organize_transactions)} transações Organize.")
 
-    # 1. Agrupa as transações por cartão
     btg_by_card = defaultdict(list)
-    for tx in btg_transactions:
+    org_by_card = defaultdict(list)
+
+    for tx in btg_txs:
         btg_by_card[tx.card_final].append(tx)
 
-    organize_by_card = defaultdict(list)
-    for tx in organize_transactions:
-        organize_by_card[tx.card_final].append(tx)
+    for tx in org_txs:
+        org_by_card[tx.card_final].append(tx)
 
-    all_card_finals = set(btg_by_card.keys()) | set(organize_by_card.keys())
     results: Dict[str, ReconciliationResult] = {}
 
-    # 2. Para cada cartão, realiza a reconciliação
-    for card_final in all_card_finals:
-        logging.info(f"Reconciliando transações para o cartão de final: {card_final}")
-        result = ReconciliationResult(card_final=card_final)
-        
-        btg_txs = btg_by_card.get(card_final, [])
-        organize_txs = organize_by_card.get(card_final, [])
-        
-        unmatched_organize_indices = set(range(len(organize_txs)))
+    for card_final in sorted(set(btg_by_card.keys()) | set(org_by_card.keys())):
+        btg = btg_by_card.get(card_final, [])
+        org = org_by_card.get(card_final, [])
 
-        for btg_tx in btg_txs:
-            best_match = None
-            highest_score = 0
-            best_match_idx = -1
-            best_diff_abs = None
+        # Index do Organize por valor quantizado
+        org_index = defaultdict(list)
+        for o in org:
+            org_index[_q(o.amount)].append(o)
 
-            # Encontra a melhor correspondência potencial na lista do Organize
-            for i, org_tx in enumerate(organize_txs):
-                if i not in unmatched_organize_indices:
-                    continue
+        used_org_ids = set()
+        missing_in_organize: List[Transaction] = []
 
-                if btg_tx.tx_date != org_tx.tx_date:
-                    continue
+        for b in btg:
+            bq = _q(b.amount)
 
-                score = fuzz.ratio(btg_tx.description_norm, org_tx.description_norm)
-                if score < SIMILARITY_THRESHOLD:
-                    continue
+            # tentativa 1: mesmo valor
+            candidates = [c for c in org_index.get(bq, []) if id(c) not in used_org_ids]
 
-                # Prioriza valor: exato (dentro da tolerância) > mais próximo > similaridade
-                diff_abs = abs(btg_tx.amount - org_tx.amount)
+            # tentativa 2: valor com sinal invertido (caso o parser tenha sinal divergente)
+            if not candidates:
+                candidates = [c for c in org_index.get(_q(-bq), []) if id(c) not in used_org_ids]
 
-                if best_match is None:
-                    best_match = org_tx
-                    best_match_idx = i
-                    highest_score = score
-                    best_diff_abs = diff_abs
-                    continue
+            # tentativa 3: absoluto (último recurso)
+            if not candidates:
+                abs_key = _q(abs(bq))
+                pool = []
+                pool.extend(org_index.get(abs_key, []))
+                pool.extend(org_index.get(_q(-abs_key), []))
+                candidates = [c for c in pool if id(c) not in used_org_ids]
 
-                # ranking: (amount_equal desc, diff_abs asc, score desc)
-                best_equal = amount_equal(btg_tx.amount, best_match.amount)
-                cur_equal = amount_equal(btg_tx.amount, org_tx.amount)
+            if not candidates:
+                missing_in_organize.append(b)
+                continue
 
-                if cur_equal and not best_equal:
-                    best_match = org_tx
-                    best_match_idx = i
-                    highest_score = score
-                    best_diff_abs = diff_abs
-                    continue
+            # Desempate: data mais próxima, depois maior similaridade
+            best = None
+            best_tuple = None
 
-                if cur_equal == best_equal:
-                    if diff_abs < best_diff_abs:
-                        best_match = org_tx
-                        best_match_idx = i
-                        highest_score = score
-                        best_diff_abs = diff_abs
-                        continue
-                    if diff_abs == best_diff_abs and score > highest_score:
-                        best_match = org_tx
-                        best_match_idx = i
-                        highest_score = score
-                        best_diff_abs = diff_abs
-                        continue
+            for c in candidates:
+                date_diff = abs((b.tx_date - c.tx_date).days) if (b.tx_date and c.tx_date) else 9999
+                sim = fuzz.ratio(b.description_norm, c.description_norm) if (b.description_norm and c.description_norm) else 0
+                tup = (date_diff, -sim)
+                if best_tuple is None or tup < best_tuple:
+                    best_tuple = tup
+                    best = c
 
-            
-            # 3. Categoriza a correspondência
-            if best_match and highest_score >= SIMILARITY_THRESHOLD:
-                unmatched_organize_indices.remove(best_match_idx)
-                
-                # Usa amount_equal para comparação de Decimais
-                if amount_equal(btg_tx.amount, best_match.amount):
-                    result.exact_matches.append((btg_tx, best_match, highest_score))
-                else:
-                    diff = btg_tx.amount - best_match.amount
-                    result.possible_divergences.append((btg_tx, best_match, highest_score, diff))
-            else:
-                # 4. Nenhuma correspondência adequada encontrada
-                result.missing_in_organize.append(btg_tx)
+            used_org_ids.add(id(best))
 
-        # 5. Identifica transações restantes do Organize como extras
-        for i in unmatched_organize_indices:
-            result.extra_in_organize.append(organize_txs[i])
-            
-        results[card_final] = result
-        logging.info(f"Finalizada a reconciliação para o cartão {card_final}: "
-                     f"{len(result.exact_matches)} correspondências exatas, "
-                     f"{len(result.possible_divergences)} divergências, "
-                     f"{len(result.missing_in_organize)} faltantes, "
-                     f"{len(result.extra_in_organize)} extras.")
+        extra_in_organize = [o for o in org if id(o) not in used_org_ids]
 
-    logging.info("Processo de reconciliação finalizado.")
+        results[card_final] = ReconciliationResult(
+            card_final=card_final,
+            missing_in_organize=missing_in_organize,
+            extra_in_organize=extra_in_organize,
+        )
+
     return results
-
-if __name__ == '__main__':
-    # Exemplo de uso para demonstração
-    print("Módulo de reconciliação carregado.")
-    # Em um cenário real, você criaria objetos Transaction simulados aqui para teste.

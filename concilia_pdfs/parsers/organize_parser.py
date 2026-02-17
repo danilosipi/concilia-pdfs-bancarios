@@ -1,38 +1,56 @@
+# concilia_pdfs/parsers/organize_parser.py
 import re
-import pdfplumber
 from typing import Iterator, Optional
 import logging
 from pathlib import Path
 
 from concilia_pdfs.core.models import Transaction, Source
 from concilia_pdfs.utils.normalization import normalize_text, parse_brl_value, parse_date
+from concilia_pdfs.utils.pdf_open import open_pdf
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 CARD_FINAL_FROM_FILENAME_RE = re.compile(r"final_(\d{4})", re.IGNORECASE)
-CARD_FINAL_FROM_TEXT_RE = re.compile(r"Final\s+(\d{4})")
+CARD_FINAL_FROM_TEXT_RE = re.compile(r"Final\s+(\d{4})", re.IGNORECASE)
 
-# Fallback: "DD/MM/YYYY Descricao -99,90"
-ORGANIZE_TEXT_RE = re.compile(
-    r"(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+(-?[\d.,]+)$"
+# Linha típica do Organize:
+# 04/02/2026 Omercadeiroiii Mercado R$ -19,99
+ORGANIZE_LINE_RE = re.compile(
+    r"^(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+R\$\s*(-?[\d.,]+)\s*$"
 )
 
 def _detect_card_final(filename: str, full_text: str) -> Optional[str]:
+    # 1) nome do arquivo "1748.pdf"
+    stem = Path(filename).stem.strip()
+    if stem.isdigit() and len(stem) == 4:
+        return stem
+
+    # 2) nome "final_1748.pdf"
     m = CARD_FINAL_FROM_FILENAME_RE.search(filename)
     if m:
         return m.group(1)
-    m = CARD_FINAL_FROM_TEXT_RE.search(full_text)
+
+    # 3) fallback no texto
+    m = CARD_FINAL_FROM_TEXT_RE.search(full_text or "")
     if m:
         return m.group(1)
+
     return None
 
-def _create_transaction(card_final: str, date_str: str, desc_raw: str, amount_str: str, raw_lines: list[str]) -> Optional[Transaction]:
+def _create_transaction(
+    card_final: str,
+    date_str: str,
+    desc_raw: str,
+    amount_str: str,
+    raw_lines: list[str],
+) -> Optional[Transaction]:
     tx_date = parse_date(date_str)
     amount = parse_brl_value(amount_str)
+
     if tx_date is None or amount is None:
         return None
 
-    # Regra: Organize vem com sinal invertido em relação ao BTG -> normalizar invertendo
+    # Organize vem invertido vs BTG -> normalizar invertendo
     amount *= -1
 
     return Transaction(
@@ -45,73 +63,87 @@ def _create_transaction(card_final: str, date_str: str, desc_raw: str, amount_st
         raw_lines=raw_lines,
     )
 
-def parse_organize_pdf(pdf_path: str) -> Iterator[Transaction]:
-    """
-    Parseia um PDF do Organize (1 PDF por cartão) e retorna Transactions normalizadas.
-    Evita duplicação: fallback por texto é processado por página.
-    """
+def parse_organize_pdf(pdf_path: str, pdf_password: Optional[str] = None) -> Iterator[Transaction]:
     logging.info(f"Iniciando análise do PDF do Organize: {pdf_path}")
     filename = Path(pdf_path).name
 
-    with pdfplumber.open(pdf_path) as pdf:
-        # Texto completo (apenas para detectar final do cartão)
+    with open_pdf(pdf_path, password=pdf_password) as pdf:
         full_text = "\n".join((page.extract_text() or "") for page in pdf.pages)
-
         card_final = _detect_card_final(filename, full_text)
+
         if not card_final:
-            logging.error(f"Não foi possível determinar o final do cartão pelo nome do arquivo ou texto para '{filename}'. Pulando.")
+            logging.error(f"[Organize] Não foi possível determinar o final do cartão para '{filename}'. Pulando.")
             return
 
         all_transactions: list[Transaction] = []
 
         for page in pdf.pages:
-            # 1) Tenta tabelas
-            tables = page.extract_tables()
-            if tables:
-                for table in tables:
-                    # Heurística: primeira linha pode ser header
-                    for row in table[1:]:
-                        if not row or len(row) < 2:
+            parsed_from_tables = 0
+
+            # 1) tenta tabelas (mas NÃO pode impedir o fallback de texto)
+            tables = page.extract_tables() or []
+            for table in tables:
+                # pode ser tabela de cabeçalho (saldo/total). Só processa linhas que pareçam transação.
+                for row in table:
+                    if not row or len(row) < 2:
+                        continue
+
+                    # data tem que ser dd/mm/yyyy
+                    date_cell = (row[0] or "").strip()
+                    if not re.match(r"^\d{2}/\d{2}/\d{2,4}$", date_cell):
+                        continue
+
+                    # tenta achar valor em alguma célula
+                    amount_cell = None
+                    for cell in reversed(row):
+                        if cell is None:
                             continue
-
-                        # data geralmente na primeira coluna
-                        date_cell = (row[0] or "").strip()
-                        if not date_cell:
+                        s = str(cell).strip()
+                        if not s:
                             continue
+                        # pode vir "-19,99" ou "R$ -19,99"
+                        s2 = s.replace("R$", "").strip()
+                        if re.match(r"^-?[\d.,]+$", s2):
+                            amount_cell = s2
+                            break
 
-                        # valor: em muitos PDFs do Organize, é a última célula preenchida
-                        amount_cell = None
-                        for cell in reversed(row):
-                            if cell is not None and str(cell).strip():
-                                amount_cell = str(cell).strip()
-                                break
-                        if not amount_cell:
+                    if not amount_cell:
+                        continue
+
+                    # descrição: junta colunas do meio (ignorando categoria/colunas vazias)
+                    mid = []
+                    for c in row[1:-1]:
+                        if c is None:
                             continue
+                        cs = str(c).strip()
+                        if cs:
+                            mid.append(cs)
+                    desc_cell = " ".join(mid).strip() if mid else (str(row[1] or "").strip())
 
-                        # descrição: geralmente na segunda coluna
-                        desc_cell = (row[1] or "").strip()
-                        if not desc_cell:
-                            continue
+                    if not desc_cell:
+                        continue
 
-                        tx = _create_transaction(card_final, date_cell, desc_cell, amount_cell, [str(row)])
-                        if tx:
-                            all_transactions.append(tx)
+                    tx = _create_transaction(card_final, date_cell, desc_cell, amount_cell, [str(row)])
+                    if tx:
+                        all_transactions.append(tx)
+                        parsed_from_tables += 1
 
-                continue  # próxima página
+            # 2) fallback por texto SEMPRE que não extrair nada útil das tabelas
+            if parsed_from_tables == 0:
+                page_text = page.extract_text() or ""
+                for line in page_text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
 
-            # 2) Fallback: texto por página (NÃO usar full_text para cada página)
-            page_text = page.extract_text() or ""
-            for line in page_text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                m = ORGANIZE_TEXT_RE.match(line)
-                if not m:
-                    continue
-                date_str, desc_raw, amount_str = m.groups()
-                tx = _create_transaction(card_final, date_str, desc_raw, amount_str, [line])
-                if tx:
-                    all_transactions.append(tx)
+                    m = ORGANIZE_LINE_RE.match(line)
+                    if not m:
+                        continue
 
-    logging.info(f"Finalizada a análise do PDF do Organize: {pdf_path}, encontradas {len(all_transactions)} transações.")
-    yield from all_transactions
+                    date_str, desc_raw, amount_str = m.groups()
+                    tx = _create_transaction(card_final, date_str, desc_raw, amount_str, [line])
+                    if tx:
+                        all_transactions.append(tx)
+
+        logging.info(f"[Organize] Arquivo={filename} card_final={card_final} transacoes_extraidas={len(all_transactions)}")
+        yield from all_transactions

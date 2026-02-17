@@ -1,127 +1,225 @@
+# concilia_pdfs/parsers/btg_parser.py
+from __future__ import annotations
+
 import re
-import pdfplumber
-from typing import Iterator
 import logging
 from datetime import date
+from typing import Iterator, Optional, List, Dict, Any, Tuple
 
 from concilia_pdfs.core.models import Transaction, Source
 from concilia_pdfs.utils.normalization import normalize_text, parse_brl_value, parse_date_d_mon
+from concilia_pdfs.utils.pdf_open import open_pdf
 
-# Regex constants for BTG parser
-CARD_FINAL_RE = re.compile(r"Final\s+(\d{4})")
-TRANSACTION_RE = re.compile(r"(\d{2}\s+\w{3})\s+(.+?)\s+R\$\s+(-?[\d.,]+)")
-INTERNATIONAL_BASE_RE = re.compile(r"(\d{2}\s+\w{3})\s+(.+?)\s+([A-Z]{3})\s+(-?[\d.,]+)")
-CONVERSION_RE = re.compile(r"Conversão para Real - R\$\s+(-?[\d.,]+)")
-YEAR_RE = re.compile(r"de\s+(20\d{2})|Fatura\s+.*(20\d{2})")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+YEAR_RE = re.compile(r"de\s+(20\d{2})|Fatura\s+.*?(20\d{2})", re.IGNORECASE)
+
+CARD_SECTION_RE = re.compile(
+    r"Lançamentos\s+do\s+cart[aã]o.*?\bFinal\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+
+TX_DEBIT_RE = re.compile(
+    r"^(\d{2}\s+\w{3})\s+(.+?)\s+R\$\s*([\d.,]+)\s*$",
+    re.IGNORECASE,
+)
+
+TX_CREDIT_RE = re.compile(
+    r"^(\d{2}\s+\w{3})\s+(.+?)\s*-\s*R\$\s*([\d.,]+)\s*$",
+    re.IGNORECASE,
+)
+
+INTERNATIONAL_BASE_RE = re.compile(
+    r"^(\d{2}\s+\w{3})\s+(.+?)\s+([A-Z]{3})\s+([\d.,]+)\s*$"
+)
+
+CONVERSION_RE = re.compile(
+    r"Convers[aã]o\s+para\s+Real\s*-\s*R\$\s*([\d.,]+)",
+    re.IGNORECASE,
+)
+
 
 def _extract_year(text: str) -> int:
-    """Extrai o ano do texto do PDF, usando o ano atual como fallback."""
-    match = YEAR_RE.search(text)
-    if match:
-        # The regex has two capture groups, one will be None
-        year_str = match.group(1) or match.group(2)
-        if year_str:
-            logging.info(f"Ano do documento detectado: {year_str}")
-            return int(year_str)
-    
-    current_year = date.today().year
-    logging.warning(f"Não foi possível detectar o ano no texto do PDF, usando o ano atual como fallback: {current_year}")
-    return current_year
+    m = YEAR_RE.search(text or "")
+    if m:
+        y = m.group(1) or m.group(2)
+        if y:
+            return int(y)
+    return date.today().year
 
-def parse_btg_pdf(pdf_path: str) -> Iterator[Transaction]:
+
+def _cluster_words_into_lines_split_columns(
+    words: List[Dict[str, Any]],
+    page_mid_x: float,
+    y_tol: float = 3.0,
+) -> List[Dict[str, Any]]:
     """
-    Parses a BTG credit card statement PDF and yields normalized Transaction objects.
+    Agrupa words por linha (top) e, dentro de cada linha, SEPARA por coluna (esq/dir) usando page_mid_x.
+    Isso evita concatenar duas transações na mesma "linha".
+    Retorna linhas com: top, x0, x1, text
     """
+    if not words:
+        return []
+
+    words = sorted(words, key=lambda w: (float(w["top"]), float(w["x0"])))
+
+    line_groups: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    current_top: Optional[float] = None
+
+    for w in words:
+        t = float(w["top"])
+        if current_top is None:
+            current_top = t
+            current = [w]
+            continue
+
+        if abs(t - current_top) <= y_tol:
+            current.append(w)
+        else:
+            line_groups.append(current)
+            current_top = t
+            current = [w]
+
+    if current:
+        line_groups.append(current)
+
+    out: List[Dict[str, Any]] = []
+
+    for group in line_groups:
+        # divide por coluna
+        left = [w for w in group if float(w["x0"]) < page_mid_x]
+        right = [w for w in group if float(w["x0"]) >= page_mid_x]
+
+        for part in (left, right):
+            if not part:
+                continue
+            part = sorted(part, key=lambda w: float(w["x0"]))
+            text = " ".join(w["text"] for w in part).strip()
+            if not text:
+                continue
+            x0 = min(float(w["x0"]) for w in part)
+            x1 = max(float(w["x1"]) for w in part)
+            top = sum(float(w["top"]) for w in part) / len(part)
+            out.append({"top": top, "x0": x0, "x1": x1, "text": text})
+
+    # Ordena por top e x0 para leitura natural
+    return sorted(out, key=lambda ln: (float(ln["top"]), float(ln["x0"])))
+
+
+def _page_lines(page) -> List[Dict[str, Any]]:
+    x0, y0, x1, y1 = page.bbox
+    mid = (x0 + x1) / 2.0
+
+    words = page.extract_words(
+        keep_blank_chars=False,
+        use_text_flow=False,   # importante: evita “colar” colunas
+        x_tolerance=2,
+        y_tolerance=2,
+    ) or []
+
+    return _cluster_words_into_lines_split_columns(words, page_mid_x=mid, y_tol=3.0)
+
+
+def parse_btg_pdf(pdf_path: str, pdf_password: Optional[str] = None) -> Iterator[Transaction]:
     logging.info(f"Iniciando análise do PDF do BTG: {pdf_path}")
-    current_card_final = None
 
-    with pdfplumber.open(pdf_path) as pdf:
+    with open_pdf(pdf_path, password=pdf_password) as pdf:
         full_text = "\n".join(page.extract_text(x_tolerance=2, y_tolerance=2) or "" for page in pdf.pages)
-        
         pdf_year = _extract_year(full_text)
-        lines = full_text.split('\n')
-        lines_iter = iter(enumerate(lines))
 
-        for i, line in lines_iter:
-            # First, check for card final change
-            card_match = CARD_FINAL_RE.search(line)
-            if card_match:
-                current_card_final = card_match.group(1)
-                logging.info(f"Alternando para processar o cartão de final: {current_card_final}")
-                continue
+        current_card_final: Optional[str] = None
 
-            if not current_card_final:
-                continue
+        for page in pdf.pages:
+            lines = _page_lines(page)
 
-            # Check for international transactions (multi-line)
-            international_match = INTERNATIONAL_BASE_RE.match(line)
-            if international_match:
-                raw_lines = [line]
-                conversion_found = False
-                # Look ahead for the conversion line
-                for j in range(1, 6): # Look at the next 5 lines
-                    next_line_index = i + j
-                    if next_line_index < len(lines):
-                        next_line = lines[next_line_index]
-                        raw_lines.append(next_line)
-                        conversion_match = CONVERSION_RE.search(next_line)
-                        if conversion_match:
-                            brl_amount_str = conversion_match.group(1)
-                            brl_amount = parse_brl_value(brl_amount_str)
-                            
-                            date_str, desc_raw, f_currency, f_amount_str = international_match.groups()
-                            tx_date = parse_date_d_mon(date_str, pdf_year)
+            i = 0
+            while i < len(lines):
+                line = lines[i]["text"]
 
-                            if brl_amount is not None and tx_date:
-                                yield Transaction(
-                                    card_final=current_card_final,
-                                    source=Source.BTG,
-                                    tx_date=tx_date,
-                                    description_raw=f"{desc_raw.strip()} (Internacional)",
-                                    description_norm=normalize_text(desc_raw),
-                                    amount=brl_amount,
-                                    foreign_currency=f_currency,
-                                    foreign_amount=parse_brl_value(f_amount_str),
-                                    raw_lines=raw_lines,
-                                )
-                            
-                            # Consume the lines we've processed from the iterator
-                            for _ in range(j):
-                                next(lines_iter, None)
-                            
-                            conversion_found = True
-                            break # Exit look-ahead loop
-                
-                if not conversion_found:
-                    logging.warning(f"Transação internacional encontrada, mas sem conversão para BRL próxima: '{line}'")
-                continue # Move to the next transaction
+                # contexto do cartão
+                msec = CARD_SECTION_RE.search(line)
+                if msec:
+                    current_card_final = msec.group(1)
+                    i += 1
+                    continue
 
-            # Check for standard domestic transactions
-            transaction_match = TRANSACTION_RE.match(line)
-            if transaction_match:
-                date_str, desc_raw, amount_str = transaction_match.groups()
-                amount = parse_brl_value(amount_str)
-                tx_date = parse_date_d_mon(date_str, pdf_year)
+                if not current_card_final:
+                    i += 1
+                    continue
 
-                if amount is not None and tx_date:
-                    yield Transaction(
-                        card_final=current_card_final,
-                        source=Source.BTG,
-                        tx_date=tx_date,
-                        description_raw=desc_raw.strip(),
-                        description_norm=normalize_text(desc_raw),
-                        amount=amount,
-                        raw_lines=[line],
-                    )
+                # internacional (pega BRL da conversão)
+                mi = INTERNATIONAL_BASE_RE.match(line)
+                if mi:
+                    date_str, desc_raw, f_currency, f_amount_str = mi.groups()
+                    raw_lines = [line]
+
+                    brl_amount = None
+                    for j in range(1, 11):
+                        if i + j >= len(lines):
+                            break
+                        nxt = lines[i + j]["text"]
+                        raw_lines.append(nxt)
+                        mc = CONVERSION_RE.search(nxt)
+                        if mc:
+                            brl_amount = parse_brl_value(mc.group(1))
+                            break
+
+                    if brl_amount is not None:
+                        tx_date = parse_date_d_mon(date_str, pdf_year)
+                        if tx_date:
+                            yield Transaction(
+                                card_final=current_card_final,
+                                source=Source.BTG,
+                                tx_date=tx_date,
+                                description_raw=f"{desc_raw.strip()} (Internacional)",
+                                description_norm=normalize_text(desc_raw),
+                                amount=brl_amount,
+                                foreign_currency=f_currency,
+                                foreign_amount=parse_brl_value(f_amount_str),
+                                raw_lines=raw_lines,
+                            )
+                    i += 1
+                    continue
+
+                # crédito (negativo)
+                mc = TX_CREDIT_RE.match(line)
+                if mc:
+                    date_str, desc_raw, amount_str = mc.groups()
+                    tx_date = parse_date_d_mon(date_str, pdf_year)
+                    amt = parse_brl_value(amount_str)
+                    if tx_date and amt is not None:
+                        yield Transaction(
+                            card_final=current_card_final,
+                            source=Source.BTG,
+                            tx_date=tx_date,
+                            description_raw=desc_raw.strip(),
+                            description_norm=normalize_text(desc_raw),
+                            amount=amt * -1,
+                            raw_lines=[line],
+                        )
+                    i += 1
+                    continue
+
+                # débito (positivo)
+                md = TX_DEBIT_RE.match(line)
+                if md:
+                    date_str, desc_raw, amount_str = md.groups()
+                    tx_date = parse_date_d_mon(date_str, pdf_year)
+                    amt = parse_brl_value(amount_str)
+                    if tx_date and amt is not None:
+                        yield Transaction(
+                            card_final=current_card_final,
+                            source=Source.BTG,
+                            tx_date=tx_date,
+                            description_raw=desc_raw.strip(),
+                            description_norm=normalize_text(desc_raw),
+                            amount=amt,
+                            raw_lines=[line],
+                        )
+                    i += 1
+                    continue
+
+                i += 1
 
     logging.info(f"Finalizada a análise do PDF do BTG: {pdf_path}")
-
-
-if __name__ == '__main__':
-    # To run this, you would need a sample BTG PDF in the correct path.
-    # pdf_file = "path/to/your/btg_statement.pdf"
-    # transactions = list(parse_btg_pdf(pdf_file))
-    # for tx in transactions:
-    #     print(tx.model_dump_json(indent=2))
-    print("Módulo de análise do BTG carregado. Nenhum arquivo processado.")
-
